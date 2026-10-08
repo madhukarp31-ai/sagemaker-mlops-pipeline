@@ -1,0 +1,150 @@
+name: Pipeline 1 - Infra - Create SageMaker Studio v1
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "cdk/**"
+      - ".github/workflows/infra-pipeline.yml"
+  workflow_dispatch:
+
+# Required for GitHub OIDC → AWS (no long-lived access keys)
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: infra-pipeline
+  cancel-in-progress: false
+
+jobs:
+  cdk-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install CDK CLI
+        run: npm install -g aws-cdk
+
+      - name: Install CDK Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r cdk/requirements.txt
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # The account must already be CDK-bootstrapped (one-time setup,
+      # see README). Bootstrapping is not run here so the CI role does
+      # not need IAM/CloudFormation admin rights.
+
+      - name: Ensure S3 Bucket Exists
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET="sagemaker-adult-income-cdk-${ACCOUNT}"
+          if aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            echo "✅ Bucket exists: $BUCKET"
+          else
+            if [ "$AWS_REGION" = "us-east-1" ]; then
+              aws s3api create-bucket --bucket "$BUCKET"
+            else
+              aws s3api create-bucket --bucket "$BUCKET" \
+                --create-bucket-configuration LocationConstraint="$AWS_REGION"
+            fi
+            aws s3api put-public-access-block --bucket "$BUCKET" \
+              --public-access-block-configuration \
+              BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+            echo "✅ Bucket created: $BUCKET"
+          fi
+
+      - name: Wait for Previous Stack Operation to Complete
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          python - <<'EOF'
+          import boto3
+          import os
+
+          region = os.environ.get("AWS_REGION", "us-east-1")
+          cf     = boto3.client("cloudformation", region_name=region)
+
+          try:
+              response = cf.describe_stacks(StackName="AdultIncomeSageMakerStack")
+              status   = response["Stacks"][0]["StackStatus"]
+              print(f"Stack status: {status}")
+
+              if "DELETE_IN_PROGRESS" in status:
+                  print("⏳ Stack deletion in progress — waiting...")
+                  waiter = cf.get_waiter("stack_delete_complete")
+                  waiter.wait(
+                      StackName="AdultIncomeSageMakerStack",
+                      WaiterConfig={"Delay": 15, "MaxAttempts": 60}
+                  )
+                  print("✅ Stack deleted — ready for fresh deploy")
+
+              elif status in ["ROLLBACK_COMPLETE", "ROLLBACK_FAILED",
+                              "CREATE_FAILED", "DELETE_FAILED"]:
+                  print(f"⏳ Stack in {status} — deleting before redeploy...")
+                  cf.delete_stack(StackName="AdultIncomeSageMakerStack")
+                  waiter = cf.get_waiter("stack_delete_complete")
+                  waiter.wait(
+                      StackName="AdultIncomeSageMakerStack",
+                      WaiterConfig={"Delay": 15, "MaxAttempts": 60}
+                  )
+                  print("✅ Stack deleted — ready for fresh deploy")
+
+              else:
+                  print(f"✅ Stack in {status} — proceeding with deploy")
+
+          except cf.exceptions.ClientError as e:
+              if "does not exist" in str(e):
+                  print("✅ No existing stack — fresh deploy")
+              else:
+                  raise
+          EOF
+
+      - name: CDK Diff
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          cd cdk
+          cdk diff AdultIncomeSageMakerStack || true
+
+      - name: CDK Deploy
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          cd cdk
+          cdk deploy AdultIncomeSageMakerStack \
+            --require-approval never \
+            --outputs-file ../cdk_outputs.json
+
+      - name: Save CDK Outputs to S3
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          python cdk/save_outputs.py
+
+      - name: Show Infra Outputs
+        run: |
+          echo "✅ CDK Stack Outputs:"
+          cat cdk_outputs.json
+          echo "✅ Saved to S3:"
+          cat infra_outputs.json
