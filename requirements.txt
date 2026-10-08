@@ -1,0 +1,5 @@
+sagemaker==2.232.2
+boto3
+scikit-learn
+pandas
+joblib
